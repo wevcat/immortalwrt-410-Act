@@ -1,6 +1,5 @@
 name: 🔒 每3天验证更新 hash
 
-
 on:
   schedule:
     - cron: '0 2 */3 * *'  # 每3天凌晨2点自动运行
@@ -125,7 +124,7 @@ jobs:
 
       - name: 安装 feeds
         if: steps.check.outputs.need_verify == 'true'
-        run: cd openwrt && ./scripts/feeds install -a 
+        run: cd openwrt && ./scripts/feeds install -a
 
       - name: 运行 diy-part2.sh
         if: steps.check.outputs.need_verify == 'true'
@@ -144,17 +143,20 @@ jobs:
           cd openwrt
           make download -j4 V=s
           find dl -size -1024c -exec rm -f {} \;
+
       - name: 清理 glib2 构建缓存 (Clean glib2 build cache)
-           if: steps.check.outputs.need_verify == 'true'
-           run: |
-             cd openwrt
-             rm -rf build_dir/target-*/glib2-* build_dir/hostpkg/glib-* staging_dir/hostpkg/lib/libffi* staging_dir/hostpkg/lib/pkgconfig/libffi.pc
+        if: steps.check.outputs.need_verify == 'true'
+        run: |
+          cd openwrt
+          rm -rf build_dir/target-*/glib2-* build_dir/hostpkg/glib-* staging_dir/hostpkg/lib/libffi* staging_dir/hostpkg/lib/pkgconfig/libffi.pc
+
       - name: 验证编译 (Verify build)
         if: steps.check.outputs.need_verify == 'true'
         id: build
         continue-on-error: true
         run: |
           cd openwrt
+          set -e
           make tools/install toolchain/install -j$(nproc)
           make package/feeds/packages/glib2/compile -j$(nproc)
           make package/feeds/packages/libmbim/compile -j$(nproc)
