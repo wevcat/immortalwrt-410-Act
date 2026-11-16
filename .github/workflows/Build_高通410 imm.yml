@@ -63,7 +63,7 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     permissions:
       contents: write
       actions: write
@@ -75,7 +75,7 @@ jobs:
       run: |
         chmod 755 ./scripts/show_hardware_info.sh
         ./scripts/show_hardware_info.sh
-  
+
     - name: Free Disk Space (Ubuntu)
       uses: jlumbroso/free-disk-space@main
       with:
@@ -86,7 +86,7 @@ jobs:
         large-packages: false
         docker-images: false
         swap-storage: true
-        
+
     - name: Initialization environment
       env:
         DEBIAN_FRONTEND: noninteractive
@@ -112,7 +112,7 @@ jobs:
         sudo timedatectl set-timezone "$TZ"
         sudo chmod 777 /mnt
         df -hT
-        
+
     - name: Ensure Python build tools
       run: |
        python3 -m pip cache purge
@@ -123,8 +123,6 @@ jobs:
        python3 -m pip install Unidecode pyelftools
        python3 -m pip --version
        python3 -c "import setuptools.build_meta; print('setuptools.build_meta OK')"
-
-
 
     - name: 读取锁定的上游 hash (Read locked upstream hash)
       id: lock
@@ -153,22 +151,45 @@ jobs:
         fi
         ln -sf /mnt/openwrt $GITHUB_WORKSPACE/openwrt
 
-
-    - name:  files
+    - name: files
       run: |
         cp -r files openwrt/files
-        cp -r overwrite/target/linux/msm89xx/dts/*  openwrt/target/linux/msm89xx/dts/
+        cp -r overwrite/target/linux/msm89xx/dts/* openwrt/target/linux/msm89xx/dts/
 
     - name: Load custom feeds
       run: |
-        [ -e $FEEDS_CONF ] && mv $FEEDS_CONF openwrt/feeds.conf.default
+        [ -e $FEEDS_CONF ] && cp $FEEDS_CONF openwrt/feeds.conf.default
         chmod +x $DIY_P1_SH
         cd openwrt
         $GITHUB_WORKSPACE/$DIY_P1_SH
-        
 
     - name: Update feeds
       run: cd openwrt && ./scripts/feeds update -a
+
+    - name: 检查并补回 libffi 包
+      run: |
+        cd openwrt
+        if [ ! -d "package/libs/libffi" ]; then
+          echo "::warning::package/libs/libffi 缺失，从 ImmortalWrt 官方仓库拉取..."
+          git clone --depth 1 https://github.com/immortalwrt/immortalwrt.git /tmp/immortalwrt-upstream
+          cp -r /tmp/immortalwrt-upstream/package/libs/libffi package/libs/libffi
+          rm -rf /tmp/immortalwrt-upstream
+          echo "已从官方仓库补回 libffi 包。"
+        else
+          echo "package/libs/libffi 已存在，无需补回。"
+        fi
+
+    - name: 修复 glib2 宿主依赖
+      run: |
+        cd openwrt
+        GLIB2_MAKEFILE="feeds/packages/libs/glib2/Makefile"
+        if [ -f "$GLIB2_MAKEFILE" ]; then
+          sed -i '/^HOST_BUILD_DEPENDS:=/s/$/ pcre2\/host libffi\/host/' "$GLIB2_MAKEFILE"
+          sed -i 's/-Dwrap_mode=forcefallback//g' "$GLIB2_MAKEFILE"
+          echo "已为 glib2 Makefile 应用宿主依赖修复。"
+        else
+          echo "::warning::$GLIB2_MAKEFILE 不存在，跳过补丁"
+        fi
 
     - name: Remove conflicting packages from smpackage
       run: |
@@ -176,12 +197,12 @@ jobs:
         rm -rf openwrt/feeds/smpackage/{base-files,dnsmasq,firewall*,fullconenat,libnftnl,nftables,ppp,opkg,ucl,upx,vsftpd*,miniupnpd-iptables,wireless-regdb}
 
     - name: Install feeds
-      run: cd openwrt && ./scripts/feeds install -a -f
+      run: cd openwrt && ./scripts/feeds install -a
 
     - name: Load custom configuration
       run: |
-        [ -e files ] && mv files openwrt/files
-        [ -e $CONFIG_FILE ] && mv $CONFIG_FILE openwrt/.config
+        [ -e files ] && cp -r files openwrt/files
+        [ -e $CONFIG_FILE ] && cp $CONFIG_FILE openwrt/.config
         chmod +x $DIY_P2_SH
         cd openwrt
         $GITHUB_WORKSPACE/$DIY_P2_SH
@@ -237,19 +258,25 @@ jobs:
             fi
           fi
         done
-        
-        
+
     - name: SSH 调试有效时间6h! 连接后输入q 输入exit即可退出，自动继续后续编译流程
       uses: mxschmitt/action-tmate@master
       if: ${{ inputs.ssh || contains(github.event.action, 'ssh') }}
-      
-      
+
     - name: Config defconfig
       id: config
       run: |
        cd openwrt
        make defconfig
-       
+
+    - name: 修复 kmod-iptables 冲突
+      run: |
+        cd openwrt
+        # Linux 6.18 下 kmod-iptables 与 kmod-nf-ipt 文件冲突，禁用 kmod-iptables
+        sed -i 's/^CONFIG_PACKAGE_kmod-iptables=y/# CONFIG_PACKAGE_kmod-iptables is not set/' .config
+        sed -i 's/^CONFIG_PACKAGE_kmod-iptables=m/# CONFIG_PACKAGE_kmod-iptables is not set/' .config
+        grep -n 'kmod-iptables' .config || true
+
     - name: Download package
       id: package
       run: |
@@ -259,13 +286,11 @@ jobs:
         find dl -size -1024c -exec rm -f {} \;
 
     - name: 查看 openwrt 目录
-      run: ls -la openwrt/
-      
+      run: |
+           ls -la openwrt/
            ls -l .config
-      
            ls -la openwrt/.config
 
- 
     - name: 自动上传最新源码生成.config编译配置
       uses: actions/upload-artifact@main
       with:
@@ -275,11 +300,11 @@ jobs:
          ${{ github.workspace }}/openwrt/feeds.conf.default
        include-hidden-files: true
 
-
     - name: Compile the firmware
       id: compile
       run: |
         cd openwrt
+        set -e
         echo -e "$(nproc) thread compile"
         make -j$(nproc) || make -j1 V=s
         echo "status=success" >> $GITHUB_OUTPUT
@@ -291,7 +316,6 @@ jobs:
       run: |
         KERNEL_VER=$(cat /mnt/openwrt/build_dir/target-*/linux-*/linux-*/.kernelversion 2>/dev/null | head -1 || echo "未知")
         echo "KERNEL_VER=$KERNEL_VER" >> $GITHUB_ENV
-
 
     - name: Check space usage
       if: (!cancelled())
@@ -391,8 +415,6 @@ jobs:
         } >> release.txt
         echo "status=success" >> $GITHUB_OUTPUT
 
-
-
     - name: Generate file list
       if: env.UPLOAD_RELEASE == 'true' && steps.organize.outputs.status == 'success'
       run: |
@@ -400,8 +422,6 @@ jobs:
         echo "Collected files:"
         cat file_list.txt
         test -s file_list.txt || { echo "::error::No firmware files found"; exit 1; }
-
-
 
     - name: Upload firmware to release
       if: env.UPLOAD_RELEASE == 'true' && steps.organize.outputs.status == 'success'
