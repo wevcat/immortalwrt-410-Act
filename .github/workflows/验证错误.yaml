@@ -1,0 +1,116 @@
+name: 🧪 单独验证 glib2 修复
+
+on:
+  workflow_dispatch:  # 仅手动触发，避免定时跑
+
+env:
+  UPSTREAM: lkiuyu/immortalwrt
+  REPO_BRANCH: master
+  FEEDS_CONF: feeds.conf.default
+  DIY_P1_SH: diy-part1.sh
+  CONFIG_FILE: config/ufi103s.config
+  TZ: Asia/Shanghai
+
+jobs:
+  test-glib2:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    name: 🔬 验证 glib2 宿主依赖修复
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free Disk Space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: false
+          dotnet: false
+          haskell: false
+          large-packages: false
+          docker-images: false
+          swap-storage: true
+
+      - name: 安装依赖
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo -E apt-get -y update
+          sudo -E apt-get -y install $(curl -fsSL https://raw.githubusercontent.com/xuxin1955/depend_ubuntu2204_openwrt/refs/heads/main/depend_ubuntu2204_openwrt)
+          sudo timedatectl set-timezone "$TZ"
+          sudo chmod 777 /mnt
+
+      - name: 克隆上游源码（浅克隆加速）
+        working-directory: /mnt
+        run: |
+          git clone --depth 1 https://github.com/$UPSTREAM -b $REPO_BRANCH openwrt
+          ln -sf /mnt/openwrt $GITHUB_WORKSPACE/openwrt
+
+      - name: 复制配置
+        run: |
+          [ -e $FEEDS_CONF ] && mv $FEEDS_CONF openwrt/feeds.conf.default
+          [ -e $CONFIG_FILE ] && cp $CONFIG_FILE openwrt/.config
+
+      - name: 运行 diy-part1.sh
+        run: |
+          if [ -f "$DIY_P1_SH" ]; then
+            chmod +x "$DIY_P1_SH"
+            cd openwrt
+            "$GITHUB_WORKSPACE/$DIY_P1_SH"
+          else
+            echo "diy-part1.sh 不存在，跳过"
+          fi
+
+      - name: 更新 feeds
+        run: cd openwrt && ./scripts/feeds update -a
+
+      - name: 修复 glib2 宿主依赖
+        run: |
+          cd openwrt
+          GLIB2_MAKEFILE="feeds/packages/libs/glib2/Makefile"
+          if [ ! -f "$GLIB2_MAKEFILE" ]; then
+            echo "::error::$GLIB2_MAKEFILE 不存在"
+            exit 1
+          fi
+          sed -i '/^HOST_BUILD_DEPENDS:=/s/$/ pcre2\/host libffi\/host/' "$GLIB2_MAKEFILE"
+          sed -i 's/-Dwrap_mode=forcefallback//g' "$GLIB2_MAKEFILE"
+          echo "--- HOST_BUILD_DEPENDS ---"
+          grep '^HOST_BUILD_DEPENDS' "$GLIB2_MAKEFILE" || true
+          echo "--- forcefallback 残留检查 ---"
+          grep -n 'forcefallback' "$GLIB2_MAKEFILE" || echo "已无 forcefallback"
+
+      - name: 删除冲突包
+        run: |
+          rm -rf openwrt/feeds/smpackage/{base-files,dnsmasq,firewall*,fullconenat,libnftnl,nftables,ppp,opkg,ucl,upx,vsftpd*,miniupnpd-iptables,wireless-regdb}
+
+      - name: 安装 feeds
+        run: cd openwrt && ./scripts/feeds install -a
+
+      - name: 生成配置
+        run: cd openwrt && make defconfig
+
+      - name: 编译 tools & toolchain
+        run: |
+          cd openwrt
+          make tools/install -j$(nproc)
+          make toolchain/install -j$(nproc)
+
+      - name: 预编译 libffi/host 与 pcre2/host
+        run: |
+          cd openwrt
+          make package/libs/libffi/host/compile -j$(nproc) V=s
+          make package/libs/pcre2/host/compile -j$(nproc) V=s
+
+      - name: 编译 glib2（关键测试）
+        run: |
+          cd openwrt
+          if make package/feeds/packages/glib2/compile V=s; then
+            echo "✅ glib2 编译成功，补丁有效！"
+          else
+            echo "❌ glib2 编译失败，以下是详细日志："
+            echo "===== host-compile.txt ====="
+            cat logs/package/feeds/packages/glib2/host-compile.txt 2>/dev/null || true
+            echo "===== compile.txt ====="
+            cat logs/package/feeds/packages/glib2/compile.txt 2>/dev/null || true
+            exit 1
+          fi
