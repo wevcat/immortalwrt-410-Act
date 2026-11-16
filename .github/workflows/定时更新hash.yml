@@ -117,6 +117,23 @@ jobs:
         if: steps.check.outputs.need_verify == 'true'
         run: cd openwrt && ./scripts/feeds update -a
 
+      - name: 修复 glib2 宿主依赖 (Patch glib2 host deps)
+        if: steps.check.outputs.need_verify == 'true'
+        run: |
+          cd openwrt
+          GLIB2_MAKEFILE="feeds/packages/libs/glib2/Makefile"
+          if [ -f "$GLIB2_MAKEFILE" ]; then
+            # 1. 添加缺失的宿主构建依赖 (pcre2/host 和 libffi/host)
+            sed -i '/^HOST_BUILD_DEPENDS:=/s/$/ pcre2\/host libffi\/host/' "$GLIB2_MAKEFILE"
+            # 2. 移除 forcefallback，禁止构建过程中临时下载依赖
+            sed -i 's/-Dwrap_mode=forcefallback//g' "$GLIB2_MAKEFILE"
+            echo "已为 glib2 Makefile 应用宿主依赖修复。"
+            echo "--- HOST_BUILD_DEPENDS 行 ---"
+            grep '^HOST_BUILD_DEPENDS' "$GLIB2_MAKEFILE" || true
+          else
+            echo "::warning::$GLIB2_MAKEFILE 不存在，跳过补丁"
+          fi
+
       - name: 删除冲突包
         if: steps.check.outputs.need_verify == 'true'
         run: |
