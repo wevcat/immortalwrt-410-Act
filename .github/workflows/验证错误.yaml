@@ -1,7 +1,7 @@
-name: 🧪 单独验证 glib2 修复
+name: 🧪 单独验证 glib2 修复（含 libffi 补回）
 
 on:
-  workflow_dispatch:  # 仅手动触发，避免定时跑
+  workflow_dispatch:
 
 env:
   UPSTREAM: lkiuyu/immortalwrt
@@ -15,7 +15,7 @@ jobs:
   test-glib2:
     runs-on: ubuntu-latest
     timeout-minutes: 90
-    name: 🔬 验证 glib2 宿主依赖修复
+    name: 🔬 验证 glib2 + libffi 修复
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -64,20 +64,40 @@ jobs:
       - name: 更新 feeds
         run: cd openwrt && ./scripts/feeds update -a
 
+      - name: 检查并补回 libffi 包
+        run: |
+          cd openwrt
+          if [ ! -d "package/libs/libffi" ]; then
+            echo "::warning::package/libs/libffi 缺失，从 ImmortalWrt 官方仓库拉取..."
+            git clone --depth 1 https://github.com/immortalwrt/immortalwrt.git /tmp/immortalwrt-upstream
+            if [ -d "/tmp/immortalwrt-upstream/package/libs/libffi" ]; then
+              cp -r /tmp/immortalwrt-upstream/package/libs/libffi package/libs/libffi
+              echo "已从官方仓库补回 libffi 包。"
+              echo "--- libffi 目录内容 ---"
+              ls -la package/libs/libffi/
+            else
+              echo "::error::官方仓库里也找不到 package/libs/libffi，请检查上游是否改名或移除"
+              exit 1
+            fi
+            rm -rf /tmp/immortalwrt-upstream
+          else
+            echo "package/libs/libffi 已存在，无需补回。"
+          fi
+
       - name: 修复 glib2 宿主依赖
         run: |
           cd openwrt
           GLIB2_MAKEFILE="feeds/packages/libs/glib2/Makefile"
-          if [ ! -f "$GLIB2_MAKEFILE" ]; then
-            echo "::error::$GLIB2_MAKEFILE 不存在"
-            exit 1
+          if [ -f "$GLIB2_MAKEFILE" ]; then
+            sed -i '/^HOST_BUILD_DEPENDS:=/s/$/ pcre2\/host libffi\/host/' "$GLIB2_MAKEFILE"
+            sed -i 's/-Dwrap_mode=forcefallback//g' "$GLIB2_MAKEFILE"
+            echo "--- HOST_BUILD_DEPENDS ---"
+            grep '^HOST_BUILD_DEPENDS' "$GLIB2_MAKEFILE" || true
+            echo "--- forcefallback 残留检查 ---"
+            grep -n 'forcefallback' "$GLIB2_MAKEFILE" || echo "已无 forcefallback"
+          else
+            echo "::warning::$GLIB2_MAKEFILE 不存在，跳过补丁"
           fi
-          sed -i '/^HOST_BUILD_DEPENDS:=/s/$/ pcre2\/host libffi\/host/' "$GLIB2_MAKEFILE"
-          sed -i 's/-Dwrap_mode=forcefallback//g' "$GLIB2_MAKEFILE"
-          echo "--- HOST_BUILD_DEPENDS ---"
-          grep '^HOST_BUILD_DEPENDS' "$GLIB2_MAKEFILE" || true
-          echo "--- forcefallback 残留检查 ---"
-          grep -n 'forcefallback' "$GLIB2_MAKEFILE" || echo "已无 forcefallback"
 
       - name: 删除冲突包
         run: |
@@ -95,10 +115,14 @@ jobs:
           make tools/install -j$(nproc)
           make toolchain/install -j$(nproc)
 
-      - name: 预编译 libffi/host 与 pcre2/host
+      - name: 编译 libffi/host（不再吞掉错误）
         run: |
           cd openwrt
           make package/libs/libffi/host/compile -j$(nproc) V=s
+
+      - name: 编译 pcre2/host
+        run: |
+          cd openwrt
           make package/libs/pcre2/host/compile -j$(nproc) V=s
 
       - name: 编译 glib2（关键测试）
