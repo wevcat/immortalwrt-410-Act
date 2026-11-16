@@ -12,13 +12,12 @@ env:
   DIY_P1_SH: diy-part1.sh
   DIY_P2_SH: diy-part2.sh
   TZ: Asia/Shanghai
-  # 用 ufi103s 作为验证机型（体积适中，包含 glib2/libmbim 依赖，最能暴露问题）
   VERIFY_PROFILE: ufi103s
   CONFIG_FILE: config/ufi103s.config
 
 jobs:
   verify-and-lock:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     permissions:
       contents: write
     name: 🔍 验证上游并更新锁定 hash
@@ -103,7 +102,7 @@ jobs:
         if: steps.check.outputs.need_verify == 'true'
         run: |
           [ -e files ] && cp -r files openwrt/files
-          [ -e $FEEDS_CONF ] && mv $FEEDS_CONF openwrt/feeds.conf.default
+          [ -e $FEEDS_CONF ] && cp $FEEDS_CONF openwrt/feeds.conf.default
           [ -e $CONFIG_FILE ] && cp $CONFIG_FILE openwrt/.config
 
       - name: 运行 diy-part1.sh
@@ -117,19 +116,29 @@ jobs:
         if: steps.check.outputs.need_verify == 'true'
         run: cd openwrt && ./scripts/feeds update -a
 
-      - name: 修复 glib2 宿主依赖 (Patch glib2 host deps)
+      - name: 检查并补回 libffi 包
+        if: steps.check.outputs.need_verify == 'true'
+        run: |
+          cd openwrt
+          if [ ! -d "package/libs/libffi" ]; then
+            echo "::warning::package/libs/libffi 缺失，从 ImmortalWrt 官方仓库拉取..."
+            git clone --depth 1 https://github.com/immortalwrt/immortalwrt.git /tmp/immortalwrt-upstream
+            cp -r /tmp/immortalwrt-upstream/package/libs/libffi package/libs/libffi
+            rm -rf /tmp/immortalwrt-upstream
+            echo "已从官方仓库补回 libffi 包。"
+          else
+            echo "package/libs/libffi 已存在，无需补回。"
+          fi
+
+      - name: 修复 glib2 宿主依赖
         if: steps.check.outputs.need_verify == 'true'
         run: |
           cd openwrt
           GLIB2_MAKEFILE="feeds/packages/libs/glib2/Makefile"
           if [ -f "$GLIB2_MAKEFILE" ]; then
-            # 1. 添加缺失的宿主构建依赖 (pcre2/host 和 libffi/host)
             sed -i '/^HOST_BUILD_DEPENDS:=/s/$/ pcre2\/host libffi\/host/' "$GLIB2_MAKEFILE"
-            # 2. 移除 forcefallback，禁止构建过程中临时下载依赖
             sed -i 's/-Dwrap_mode=forcefallback//g' "$GLIB2_MAKEFILE"
             echo "已为 glib2 Makefile 应用宿主依赖修复。"
-            echo "--- HOST_BUILD_DEPENDS 行 ---"
-            grep '^HOST_BUILD_DEPENDS' "$GLIB2_MAKEFILE" || true
           else
             echo "::warning::$GLIB2_MAKEFILE 不存在，跳过补丁"
           fi
@@ -161,12 +170,6 @@ jobs:
           make download -j4 V=s
           find dl -size -1024c -exec rm -f {} \;
 
-      - name: 清理 glib2 构建缓存 (Clean glib2 build cache)
-        if: steps.check.outputs.need_verify == 'true'
-        run: |
-          cd openwrt
-          rm -rf build_dir/target-*/glib2-* build_dir/hostpkg/glib-* staging_dir/hostpkg/lib/libffi* staging_dir/hostpkg/lib/pkgconfig/libffi.pc
-
       - name: 验证编译 (Verify build)
         if: steps.check.outputs.need_verify == 'true'
         id: build
@@ -174,10 +177,30 @@ jobs:
         run: |
           cd openwrt
           set -e
+          echo "===== [1/6] tools & toolchain ====="
           make tools/install toolchain/install -j$(nproc)
-          make package/feeds/packages/glib2/compile -j$(nproc)
+
+          echo "===== [2/6] libffi/host ====="
+          make package/libs/libffi/host/compile -j$(nproc) V=s
+
+          echo "===== [3/6] pcre2/host ====="
+          make package/libs/pcre2/host/compile -j$(nproc) V=s
+
+          echo "===== [4/6] glib2 ====="
+          if ! make package/feeds/packages/glib2/compile V=s; then
+            echo "===== glib2 详细日志 host-compile.txt ====="
+            cat logs/package/feeds/packages/glib2/host-compile.txt 2>/dev/null || true
+            echo "===== glib2 详细日志 compile.txt ====="
+            cat logs/package/feeds/packages/glib2/compile.txt 2>/dev/null || true
+            exit 1
+          fi
+
+          echo "===== [5/6] libmbim ====="
           make package/feeds/packages/libmbim/compile -j$(nproc)
+
+          echo "===== [6/6] 完整编译 ====="
           make -j$(nproc) || make -j1 V=s
+
           echo "status=success" >> $GITHUB_OUTPUT
 
       - name: 更新锁定 hash (Update locked hash on success)
@@ -189,7 +212,6 @@ jobs:
           git fetch origin main
           git reset --hard origin/main
           echo "$NEW_HASH" > upstream_lock.txt
-          # 新记录插入文件最前面
           NEW_LINE="$(date '+%Y-%m-%d') $NEW_HASH"
           if [ -f upstream_history.txt ]; then
             echo -e "$NEW_LINE\n$(cat upstream_history.txt)" > upstream_history.txt
