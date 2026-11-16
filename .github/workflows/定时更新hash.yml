@@ -1,5 +1,6 @@
 name: 🔒 每3天验证更新 hash
 
+
 on:
   schedule:
     - cron: '0 2 */3 * *'  # 每3天凌晨2点自动运行
